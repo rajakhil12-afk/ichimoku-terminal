@@ -407,43 +407,90 @@ function parseCSV(text) {
 }
 
 // =========================================================
-// YAHOO FINANCE FETCH
 // =========================================================
-function getYahooParams(tf) {
-    switch(tf) { case"5":return{interval:"5m",mins:5}; case"60":return{interval:"1h",mins:60}; case"240":return{interval:"1h",mins:60}; case"1D":return{interval:"1d",mins:1440}; case"1W":return{interval:"1wk",mins:7200}; default:return{interval:"1h",mins:60}; }
+// TWELVE DATA API  (direct CORS — no proxy needed)
+// =========================================================
+const TWELVE_API_KEY = "8e18f45ecbe44f64af5bdd61e577f954";
+const TWELVE_BASE    = "https://api.twelvedata.com";
+
+// Map our internal TF values → Twelve Data interval strings + bar minutes
+function getTwelveParams(tf) {
+    switch(tf) {
+        case "1":   return { interval:"1min",  mins:1    };
+        case "3":   return { interval:"5min",  mins:5    }; // 3min not on free tier, use 5min
+        case "5":   return { interval:"5min",  mins:5    };
+        case "60":  return { interval:"1h",    mins:60   };
+        case "240": return { interval:"4h",    mins:240  };
+        case "1D":  return { interval:"1day",  mins:1440 };
+        case "1W":  return { interval:"1week", mins:7200 };
+        default:    return { interval:"1h",    mins:60   };
+    }
 }
 
-async function fetchJsonWithFallback(url) {
-    const proxies = [
-        "https://ichimoku-proxy.rajakhil12-afk.workers.dev/?url=",
-        "https://api.allorigins.win/raw?url=",
-        "https://corsproxy.io/?"
-    ];
-    let lastErr = null;
-    for (const p of proxies) {
-        try {
-            const res  = await fetch(p + encodeURIComponent(url));
-            if (!res.ok) { lastErr = new Error(`HTTP ${res.status}`); continue; }
-            const text = await res.text();
-            const json = JSON.parse(text);
-            if (!json.chart) { lastErr = new Error("Invalid Yahoo response"); continue; }
-            return json;
-        } catch(e) { lastErr = e; }
+// Map range dropdown → outputsize (number of bars to fetch)
+function rangeToOutputsize(range, mins) {
+    const barsPerDay = Math.floor(1440 / mins);
+    switch(range) {
+        case "5d":  return Math.min(barsPerDay * 5,   500);
+        case "1mo": return Math.min(barsPerDay * 30,  500);
+        case "3mo": return Math.min(barsPerDay * 90,  800);
+        case "6mo": return Math.min(barsPerDay * 180, 1000);
+        case "1y":  return Math.min(barsPerDay * 365, 2000);
+        case "2y":  return Math.min(barsPerDay * 730, 3000);
+        case "5y":  return Math.min(barsPerDay * 1825,4500);
+        case "max": return 5000;
+        default:    return 500;
     }
-    throw lastErr || new Error("All proxies failed");
 }
 
-async function fetchYahooData(ticker, interval, range) {
-    const url  = `https://query1.finance.yahoo.com/v8/finance/chart/${encodeURIComponent(ticker)}?interval=${interval}&range=${range}`;
-    const json = await fetchJsonWithFallback(url);
-    const res  = json.chart.result[0];
-    const q    = res.indicators.quote[0];
-    const data = [];
-    for (let i = 0; i < res.timestamp.length; i++) {
-        if (!q.open[i] || !q.high[i] || !q.low[i] || !q.close[i]) continue;
-        data.push({ time:res.timestamp[i], open:+q.open[i].toFixed(8), high:+q.high[i].toFixed(8), low:+q.low[i].toFixed(8), close:+q.close[i].toFixed(8) });
-    }
-    return data;
+// Convert app symbol presets → Twelve Data symbol format
+function toTwelveSymbol(ticker) {
+    const map = {
+        // Crypto
+        "BTC-USD": "BTC/USD", "ETH-USD": "ETH/USD", "SOL-USD": "SOL/USD",
+        "BNB-USD": "BNB/USD", "XRP-USD": "XRP/USD",
+        // Forex
+        "EURUSD=X": "EUR/USD", "GBPUSD=X": "GBP/USD", "JPY=X":    "USD/JPY",
+        "AUDUSD=X": "AUD/USD", "USDCAD=X": "USD/CAD", "CHF=X":    "USD/CHF",
+        // Commodities (Twelve Data uses names)
+        "GC=F": "XAU/USD", "SI=F": "XAG/USD", "CL=F": "WTI/USD",
+        "NG=F": "NGAS/USD","HG=F": "COPPER/USD",
+        // US Indices
+        "^GSPC": "SPX", "^NDX": "NDX", "^DJI": "DJI",
+        // Global Indices
+        "^GDAXI": "DAX", "^N225": "N225",
+        // Indian Indices
+        "^NSEI": "NIFTY", "^NSEBANK": "BANKNIFTY",
+        // Indian NSE Stocks
+        "RELIANCE.NS": "RELIANCE:NSE", "TCS.NS":        "TCS:NSE",
+        "HDFCBANK.NS": "HDFCBANK:NSE", "INFY.NS":       "INFY:NSE",
+        "ICICIBANK.NS":"ICICIBANK:NSE","TATAMOTORS.NS":  "TATAMOTORS:NSE",
+        "SBIN.NS":     "SBIN:NSE"
+    };
+    return map[ticker] || ticker;
+}
+
+async function fetchTwelveData(ticker, interval, outputsize) {
+    const symbol = toTwelveSymbol(ticker);
+    const url    = `${TWELVE_BASE}/time_series?symbol=${encodeURIComponent(symbol)}&interval=${interval}&outputsize=${outputsize}&apikey=${TWELVE_API_KEY}&format=JSON`;
+
+    const res  = await fetch(url);
+    if (!res.ok) throw new Error(`Twelve Data HTTP ${res.status}`);
+    const json = await res.json();
+
+    if (json.status === "error") throw new Error(`Twelve Data: ${json.message}`);
+    if (!json.values || !json.values.length) throw new Error("Twelve Data: no data returned");
+
+    // Values come newest-first — reverse to oldest-first
+    const values = [...json.values].reverse();
+
+    return values.map(v => ({
+        time:  Math.floor(new Date(v.datetime).getTime() / 1000),
+        open:  parseFloat(v.open),
+        high:  parseFloat(v.high),
+        low:   parseFloat(v.low),
+        close: parseFloat(v.close)
+    })).filter(d => !isNaN(d.open) && !isNaN(d.close));
 }
 
 function aggregateBaseData(raw, mult) {
@@ -1075,21 +1122,20 @@ async function runBacktestSimulation() {
         if (!ticker) { alert("Please enter a ticker symbol."); return; }
         const tfVal  = baseTimeframeSelect.value;
         const range  = baseRangeSelect.value;
-        const params = getYahooParams(tfVal);
+        const params = getTwelveParams(tfVal);
         baseMinutes  = params.mins;
+        const outputsize = rangeToOutputsize(range, params.mins);
         btnRun.disabled = true; btnRun.textContent = "⟳ Loading...";
-        showLoading(`Fetching ${ticker} (${tfVal})...`);
+        showLoading(`Fetching ${ticker} via Twelve Data...`);
         try {
-            const fetchInterval = (tfVal==="240") ? "1h" : params.interval;
-            let raw = await fetchYahooData(ticker, fetchInterval, range);
-            chartData = (tfVal==="240") ? aggregateBaseData(raw, 4) : raw;
+            chartData = await fetchTwelveData(ticker, params.interval, outputsize);
+            if (!chartData.length) throw new Error("No bars returned");
             const tfName = baseTimeframeSelect.options[baseTimeframeSelect.selectedIndex].text;
-            // tf-display removed — TF bar handles this;
-            $("data-seed-type").textContent   = "Market: Live API";
+            $("data-seed-type").textContent = `Market: Live (${toTwelveSymbol(ticker)})`;
         } catch(err) {
-            alert("Fetch failed: " + err.message + "\nUsing simulated data.");
+            alert("Twelve Data fetch failed: " + err.message + "\nUsing simulated data.\n\nTip: Check your API key or try a different symbol/timeframe.");
             chartData = generateMarketData("trend-up", 800);
-            // tf-display removed — TF bar handles this;
+            $("data-seed-type").textContent = "Market: Sim (fallback)";
         } finally {
             btnRun.disabled = false; btnRun.textContent = "▶ Run Backtest  ";
             hideLoading();
